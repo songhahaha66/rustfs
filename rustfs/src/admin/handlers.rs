@@ -81,14 +81,13 @@ pub mod kms_dynamic;
 pub mod kms_keys;
 pub mod policies;
 pub mod pools;
+pub mod profile;
 pub mod rebalance;
 pub mod service_account;
 pub mod sts;
 pub mod tier;
 pub mod trace;
 pub mod user;
-#[cfg(not(target_os = "windows"))]
-use pprof::protos::Message;
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Default)]
@@ -144,7 +143,7 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let conditions = get_condition_values(&req.headers, &cred_clone);
+        let conditions = get_condition_values(&req.headers, &cred_clone, None, None);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -323,7 +322,7 @@ impl Operation for ServiceHandle {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle ServiceHandle");
 
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
 
@@ -367,7 +366,7 @@ impl Operation for InspectDataHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle InspectDataHandler");
 
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
 
@@ -431,7 +430,10 @@ impl Operation for DataUsageInfoHandler {
             &cred,
             owner,
             false,
-            vec![Action::AdminAction(AdminAction::DataUsageInfoAdminAction)],
+            vec![
+                Action::AdminAction(AdminAction::DataUsageInfoAdminAction),
+                Action::S3Action(S3Action::ListBucketAction),
+            ],
         )
         .await?;
 
@@ -486,7 +488,7 @@ impl Operation for DataUsageInfoHandler {
 
             let mut info_for_refresh = info.clone();
             let store_for_refresh = store.clone();
-            tokio::spawn(async move {
+            spawn(async move {
                 if let Err(e) = collect_realtime_data_usage(&mut info_for_refresh, store_for_refresh.clone()).await {
                     warn!("Background data usage refresh failed: {}", e);
                     return;
@@ -638,10 +640,7 @@ impl Operation for MetricsHandler {
         let mp = extract_metrics_init_params(&req.uri);
         info!("mp: {:?}", mp);
 
-        let tick = match parse_duration(&mp.tick) {
-            Ok(i) => i,
-            Err(_) => std_Duration::from_secs(1),
-        };
+        let tick = parse_duration(&mp.tick).unwrap_or_else(|_| std_Duration::from_secs(3));
 
         let mut n = mp.n;
         if n == 0 {
@@ -654,28 +653,18 @@ impl Operation for MetricsHandler {
             MetricType::ALL
         };
 
-        let disks = mp.disks.split(",").map(String::from).collect::<Vec<String>>();
-        let by_disk = mp.by_disk == "true";
-        let mut disk_map = HashSet::new();
-        if !disks.is_empty() && !disks[0].is_empty() {
-            for d in disks.iter() {
-                if !d.is_empty() {
-                    disk_map.insert(d.to_string());
-                }
-            }
+        fn parse_comma_separated(s: &str) -> HashSet<String> {
+            s.split(',').filter(|part| !part.is_empty()).map(String::from).collect()
         }
 
+        let disks = parse_comma_separated(&mp.disks);
+        let by_disk = mp.by_disk == "true";
+        let disk_map = disks;
+
         let job_id = mp.by_job_id;
-        let hosts = mp.hosts.split(",").map(String::from).collect::<Vec<String>>();
+        let hosts = parse_comma_separated(&mp.hosts);
         let by_host = mp.by_host == "true";
-        let mut host_map = HashSet::new();
-        if !hosts.is_empty() && !hosts[0].is_empty() {
-            for d in hosts.iter() {
-                if !d.is_empty() {
-                    host_map.insert(d.to_string());
-                }
-            }
-        }
+        let host_map = hosts;
 
         let d_id = mp.by_dep_id;
         let mut interval = interval(tick);
@@ -691,7 +680,7 @@ impl Operation for MetricsHandler {
             inner: ReceiverStream::new(rx),
         });
         let body = Body::from(in_stream);
-        tokio::spawn(async move {
+        spawn(async move {
             while n > 0 {
                 info!("loop, n: {n}");
                 let mut m = RealtimeMetrics::default();
@@ -929,7 +918,7 @@ impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!("handle BackgroundHealStatusHandler");
 
-        return Err(s3_error!(NotImplemented));
+        Err(s3_error!(NotImplemented))
     }
 }
 
@@ -964,7 +953,7 @@ impl Operation for GetReplicationMetricsHandler {
         }
         //return Err(s3_error!(InvalidArgument, "Invalid bucket name"));
         //Ok(S3Response::with_headers((StatusCode::OK, Body::from()), header))
-        return Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))));
+        Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))))
     }
 }
 
@@ -991,7 +980,7 @@ impl Operation for SetRemoteTargetHandler {
         };
 
         store
-            .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
+            .get_bucket_info(bucket, &BucketOptions::default())
             .await
             .map_err(ApiError::from)?;
 
@@ -1005,7 +994,7 @@ impl Operation for SetRemoteTargetHandler {
         };
 
         let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
-            tracing::error!("Failed to parse BucketTarget from body: {}", e);
+            error!("Failed to parse BucketTarget from body: {}", e);
             ApiError::other(e)
         })?;
 
@@ -1117,10 +1106,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
-            if let Err(err) = store
-                .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
-                .await
-            {
+            if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
                 error!("Error fetching bucket info: {:?}", err);
                 return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
             }
@@ -1149,7 +1135,7 @@ impl Operation for ListRemoteTargetHandler {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-        return Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(json_targets)), header))
     }
 }
 
@@ -1174,10 +1160,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
-        if let Err(err) = store
-            .get_bucket_info(bucket, &rustfs_ecstore::store_api::BucketOptions::default())
-            .await
-        {
+        if let Err(err) = store.get_bucket_info(bucket, &BucketOptions::default()).await {
             error!("Error fetching bucket info: {:?}", err);
             return Ok(S3Response::new((StatusCode::BAD_REQUEST, Body::from("Invalid bucket".to_string()))));
         }
@@ -1206,7 +1189,7 @@ impl Operation for RemoveRemoteTargetHandler {
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
 
-        return Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))));
+        Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }
 }
 
@@ -1216,9 +1199,7 @@ async fn collect_realtime_data_usage(
     store: Arc<rustfs_ecstore::store::ECStore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Get bucket list and collect basic statistics
-    let buckets = store
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions::default())
-        .await?;
+    let buckets = store.list_bucket(&BucketOptions::default()).await?;
 
     info.buckets_count = buckets.len() as u64;
     info.last_update = Some(std::time::SystemTime::now());
@@ -1282,14 +1263,8 @@ impl Operation for ProfileHandler {
 
         #[cfg(not(target_os = "windows"))]
         {
-            use crate::profiling;
-
-            if !profiling::is_profiler_enabled() {
-                return Ok(S3Response::new((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Body::from("Profiler not enabled. Set RUSTFS_ENABLE_PROFILING=true to enable profiling".to_string()),
-                )));
-            }
+            use rustfs_config::{DEFAULT_CPU_FREQ, ENV_CPU_FREQ};
+            use rustfs_utils::get_env_usize;
 
             let queries = extract_query_params(&req.uri);
             let seconds = queries.get("seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
@@ -1302,72 +1277,55 @@ impl Operation for ProfileHandler {
                 )));
             }
 
-            let guard = match profiling::get_profiler_guard() {
-                Some(guard) => guard,
-                None => {
-                    return Ok(S3Response::new((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Body::from("Profiler not initialized".to_string()),
-                    )));
-                }
-            };
-
-            info!("Starting CPU profile collection for {} seconds", seconds);
-
-            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-
-            let guard_lock = match guard.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    error!("Failed to acquire profiler guard lock");
-                    return Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from("Failed to acquire profiler lock".to_string()),
-                    )));
-                }
-            };
-
-            let report = match guard_lock.report().build() {
-                Ok(report) => report,
-                Err(e) => {
-                    error!("Failed to build profiler report: {}", e);
-                    return Ok(S3Response::new((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Body::from(format!("Failed to build profile report: {e}")),
-                    )));
-                }
-            };
-
-            info!("CPU profile collection completed");
-
             match format.as_str() {
-                "protobuf" | "pb" => {
-                    let profile = report.pprof().unwrap();
-                    let mut body = Vec::new();
-                    if let Err(e) = profile.write_to_vec(&mut body) {
-                        error!("Failed to serialize protobuf profile: {}", e);
-                        return Ok(S3Response::new((
+                "protobuf" | "pb" => match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(seconds)).await {
+                    Ok(path) => match tokio::fs::read(&path).await {
+                        Ok(bytes) => {
+                            let mut headers = HeaderMap::new();
+                            headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+                            Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
+                        }
+                        Err(e) => Ok(S3Response::new((
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            Body::from("Failed to serialize profile".to_string()),
-                        )));
-                    }
-
-                    let mut headers = HeaderMap::new();
-                    headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
-                }
+                            Body::from(format!("Failed to read profile file: {e}")),
+                        ))),
+                    },
+                    Err(e) => Ok(S3Response::new((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Body::from(format!("Failed to collect CPU profile: {e}")),
+                    ))),
+                },
                 "flamegraph" | "svg" => {
-                    let mut flamegraph_buf = Vec::new();
-                    match report.flamegraph(&mut flamegraph_buf) {
-                        Ok(()) => (),
+                    let freq = get_env_usize(ENV_CPU_FREQ, DEFAULT_CPU_FREQ) as i32;
+                    let guard = match pprof::ProfilerGuard::new(freq) {
+                        Ok(g) => g,
                         Err(e) => {
-                            error!("Failed to generate flamegraph: {}", e);
                             return Ok(S3Response::new((
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to generate flamegraph: {e}")),
+                                Body::from(format!("Failed to create profiler: {e}")),
                             )));
                         }
                     };
+
+                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+
+                    let report = match guard.report().build() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Ok(S3Response::new((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Body::from(format!("Failed to build profile report: {e}")),
+                            )));
+                        }
+                    };
+
+                    let mut flamegraph_buf = Vec::new();
+                    if let Err(e) = report.flamegraph(&mut flamegraph_buf) {
+                        return Ok(S3Response::new((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Body::from(format!("Failed to generate flamegraph: {e}")),
+                        )));
+                    }
 
                     let mut headers = HeaderMap::new();
                     headers.insert(CONTENT_TYPE, "image/svg+xml".parse().unwrap());
@@ -1398,9 +1356,11 @@ impl Operation for ProfileStatusHandler {
 
         #[cfg(not(target_os = "windows"))]
         let status = {
-            use crate::profiling;
+            use rustfs_config::{DEFAULT_ENABLE_PROFILING, ENV_ENABLE_PROFILING};
+            use rustfs_utils::get_env_bool;
 
-            if profiling::is_profiler_enabled() {
+            let enabled = get_env_bool(ENV_ENABLE_PROFILING, DEFAULT_ENABLE_PROFILING);
+            if enabled {
                 HashMap::from([
                     ("enabled", "true"),
                     ("status", "running"),

@@ -12,14 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::AppConfig;
 use crate::telemetry::{OtelGuard, init_telemetry};
+use crate::{AppConfig, SystemObserver};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OnceCell, SetError};
 use tracing::{error, info};
 
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
+
+/// Flag indicating if observability is enabled
+pub(crate) static IS_OBSERVABILITY_ENABLED: OnceCell<bool> = OnceCell::const_new();
+
+/// Check whether Observability is enabled
+pub fn is_observability_enabled() -> bool {
+    IS_OBSERVABILITY_ENABLED.get().copied().unwrap_or(false)
+}
 
 /// Error type for global guard operations
 #[derive(Debug, thiserror::Error)]
@@ -56,18 +64,33 @@ pub enum GlobalError {
 ///
 /// # Example
 /// ```no_run
-/// use rustfs_obs::init_obs;
+/// # use rustfs_obs::init_obs;
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// let guard = init_obs(None).await;
+/// #    let guard = init_obs(None).await;
 /// # }
 /// ```
 pub async fn init_obs(endpoint: Option<String>) -> OtelGuard {
     // Load the configuration file
     let config = AppConfig::new_with_endpoint(endpoint);
 
-    init_telemetry(&config.observability)
+    let otel_guard = init_telemetry(&config.observability);
+    // Server will be created per connection - this ensures isolation
+    tokio::spawn(async move {
+        // Record the PID-related metrics of the current process
+        let obs_result = SystemObserver::init_process_observer().await;
+        match obs_result {
+            Ok(_) => {
+                info!(target: "rustfs::obs::system::metrics","Process observer initialized successfully");
+            }
+            Err(e) => {
+                error!(target: "rustfs::obs::system::metrics","Failed to initialize process observer: {}", e);
+            }
+        }
+    });
+
+    otel_guard
 }
 
 /// Set the global guard for OpenTelemetry
@@ -80,14 +103,14 @@ pub async fn init_obs(endpoint: Option<String>) -> OtelGuard {
 /// * `Err(GuardError)` if setting fails
 ///
 /// # Example
-/// ```rust
-/// use rustfs_obs::{ init_obs, set_global_guard};
+/// ```no_run
+/// # use rustfs_obs::{ init_obs, set_global_guard};
 ///
-/// async fn init() -> Result<(), Box<dyn std::error::Error>> {
-///     let guard = init_obs(None).await;
-///     set_global_guard(guard)?;
-///     Ok(())
-/// }
+/// # async fn init() -> Result<(), Box<dyn std::error::Error>> {
+/// #    let guard = init_obs(None).await;
+/// #    set_global_guard(guard)?;
+/// #    Ok(())
+/// # }
 /// ```
 pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
     info!("Initializing global OpenTelemetry guard");
@@ -101,27 +124,18 @@ pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
 /// * `Err(GuardError)` if guard not initialized
 ///
 /// # Example
-/// ```rust
-/// use rustfs_obs::get_global_guard;
+/// ```no_run
+/// # use rustfs_obs::get_global_guard;
 ///
-/// async fn trace_operation() -> Result<(), Box<dyn std::error::Error>> {
-///     let guard = get_global_guard()?;
-///     let _lock = guard.lock().unwrap();
-///     // Perform traced operation
-///     Ok(())
-/// }
+/// # async fn trace_operation() -> Result<(), Box<dyn std::error::Error>> {
+/// #    let guard = get_global_guard()?;
+/// #    let _lock = guard.lock().unwrap();
+/// #    // Perform traced operation
+/// #    Ok(())
+/// # }
 /// ```
 pub fn get_global_guard() -> Result<Arc<Mutex<OtelGuard>>, GlobalError> {
     GLOBAL_GUARD.get().cloned().ok_or(GlobalError::NotInitialized)
-}
-
-/// Try to get the global guard for OpenTelemetry
-///
-/// # Returns
-/// * `Some(Arc<Mutex<OtelGuard>>)` if guard exists
-/// * `None` if guard not initialized
-pub fn try_get_global_guard() -> Option<Arc<Mutex<OtelGuard>>> {
-    GLOBAL_GUARD.get().cloned()
 }
 
 #[cfg(test)]

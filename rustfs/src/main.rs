@@ -25,10 +25,10 @@ mod storage;
 mod update;
 mod version;
 
-use crate::admin::console::init_console_cfg;
+// Ensure the correct path for parse_license is imported
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-    start_audit_system, start_console_server, start_http_server, stop_audit_system, wait_for_shutdown,
+    start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
@@ -63,6 +63,7 @@ use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
 use s3s::s3_error;
+use std::env;
 use std::io::{Error, Result};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -98,25 +99,9 @@ fn print_server_info() {
 }
 
 fn main() -> Result<()> {
-    let mut builder = server::get_tokio_runtime_builder();
-    builder.enable_all();
-    if server::print_tokio_thread_enable() {
-        builder.on_thread_start(|| {
-            println!(
-                "RustFS Worker Thread running - initializing resources time: {:?}, thread id: {:?}",
-                chrono::Utc::now().to_rfc3339(),
-                std::thread::current().id()
-            );
-        });
-        builder.on_thread_stop(|| {
-            println!(
-                "RustFS Worker Thread stopping - cleaning up resources time: {:?}, thread id: {:?}",
-                chrono::Utc::now().to_rfc3339(),
-                std::thread::current().id()
-            )
-        });
-    }
-    let runtime = builder.build().expect("Failed to build Tokio runtime");
+    let runtime = server::get_tokio_runtime_builder()
+        .build()
+        .expect("Failed to build Tokio runtime");
     runtime.block_on(async_main())
 }
 async fn async_main() -> Result<()> {
@@ -133,26 +118,31 @@ async fn async_main() -> Result<()> {
     info!("{}", LOGO);
 
     // Store in global storage
-    set_global_guard(guard).map_err(Error::other)?;
+    match set_global_guard(guard).map_err(Error::other) {
+        Ok(_) => (),
+        Err(e) => {
+            error!("Failed to set global observability guard: {}", e);
+            return Err(e);
+        }
+    }
 
     // Initialize performance profiling if enabled
     #[cfg(not(target_os = "windows"))]
-    profiling::start_profiling_if_enabled();
+    profiling::init_from_env().await;
 
     // Run parameters
-    run(opt).await
+    match run(opt).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            error!("Server encountered an error and is shutting down: {}", e);
+            Err(e)
+        }
+    }
 }
 
 #[instrument(skip(opt))]
 async fn run(opt: config::Opt) -> Result<()> {
     debug!("opt: {:?}", &opt);
-
-    // // Initialize global DNS resolver early for enhanced DNS resolution (concurrent)
-    // let dns_init = tokio::spawn(async {
-    //     if let Err(e) = rustfs_utils::dns_resolver::init_global_dns_resolver().await {
-    //         warn!("Failed to initialize global DNS resolver: {}. Using standard DNS resolution.", e);
-    //     }
-    // });
 
     if let Some(region) = &opt.region {
         rustfs_ecstore::global::set_global_region(region.clone());
@@ -173,14 +163,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     );
 
     // Set up AK and SK
-    rustfs_ecstore::global::init_global_action_cred(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
 
     set_global_rustfs_port(server_port);
 
     set_global_addr(&opt.address).await;
-
-    // // Wait for DNS initialization to complete before network-heavy operations
-    // dns_init.await.map_err(Error::other)?;
 
     // For RPC
     let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
@@ -224,53 +211,21 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);
 
-    let shutdown_tx = start_http_server(&opt, state_manager.clone()).await?;
-    // Start console server if enabled
-    let console_shutdown_tx = shutdown_tx.clone();
-    if opt.console_enable && !opt.console_address.is_empty() {
-        // Deal with port mapping issues for virtual machines like docker
-        let (external_addr, external_port) = if !opt.external_address.is_empty() {
-            let external_addr = parse_and_resolve_address(opt.external_address.as_str()).map_err(Error::other)?;
-            let external_port = external_addr.port();
-            if external_port != server_port {
-                warn!(
-                    "External port {} is different from server port {}, ensure your firewall allows access to the external port if needed.",
-                    external_port, server_port
-                );
-            }
-            info!(
-                target: "rustfs::main::run",
-                external_address = %external_addr,
-                external_port = %external_port,
-                "Using external address {} for endpoint access", external_addr
-            );
-            rustfs_ecstore::global::set_global_rustfs_external_port(external_port);
-            set_global_addr(&opt.external_address).await;
-            (external_addr.ip(), external_port)
-        } else {
-            (server_addr.ip(), server_port)
-        };
-        warn!("Starting console server on address: '{}', port: '{}'", external_addr, external_port);
-        // init console configuration
-        init_console_cfg(external_addr, external_port);
+    let s3_shutdown_tx = {
+        let mut s3_opt = opt.clone();
+        s3_opt.console_enable = false;
+        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone()).await?;
+        Some(s3_shutdown_tx)
+    };
 
-        let opt_clone = opt.clone();
-        tokio::spawn(async move {
-            let console_shutdown_rx = console_shutdown_tx.subscribe();
-            if let Err(e) = start_console_server(&opt_clone, console_shutdown_rx).await {
-                error!("Console server failed to start: {}", e);
-            }
-        });
+    let console_shutdown_tx = if opt.console_enable && !opt.console_address.is_empty() {
+        let mut console_opt = opt.clone();
+        console_opt.address = console_opt.console_address.clone();
+        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone()).await?;
+        Some(console_shutdown_tx)
     } else {
-        info!("Console server is disabled.");
-        info!("You can access the RustFS API at {}", &opt.address);
-        info!("For more information, visit https://rustfs.com/docs/");
-        info!("To enable the console, restart the server with --console-enable and a valid --console-address.");
-        info!(
-            "Current console address is set to: '{}' ,console enable is set to: '{}'",
-            &opt.console_address, &opt.console_enable
-        );
-    }
+        None
+    };
 
     set_global_endpoints(endpoint_pools.as_ref().clone());
     update_erasure_type(setup_type).await;
@@ -379,11 +334,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
+            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -396,7 +351,7 @@ async fn run(opt: config::Opt) -> Result<()> {
 /// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
 /// false if set to false/0/no/off/disabled
 fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
-    std::env::var(var_name)
+    env::var(var_name)
         .unwrap_or_else(|_| default.to_string())
         .parse::<bool>()
         .unwrap_or(default)
@@ -405,7 +360,8 @@ fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
-    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -462,7 +418,12 @@ async fn handle_shutdown(
         target: "rustfs::main::handle_shutdown",
         "Server is stopping..."
     );
-    let _ = shutdown_tx.send(());
+    if let Some(s3_shutdown_tx) = s3_shutdown_tx {
+        let _ = s3_shutdown_tx.send(());
+    }
+    if let Some(console_shutdown_tx) = console_shutdown_tx {
+        let _ = console_shutdown_tx.send(());
+    }
 
     // Wait for the worker thread to complete the cleaning work
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
@@ -477,7 +438,7 @@ async fn handle_shutdown(
 }
 
 fn init_update_check() {
-    let update_check_enable = std::env::var(ENV_UPDATE_CHECK)
+    let update_check_enable = env::var(ENV_UPDATE_CHECK)
         .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
         .parse::<bool>()
         .unwrap_or(DEFAULT_UPDATE_CHECK);

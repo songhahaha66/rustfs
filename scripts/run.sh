@@ -46,7 +46,6 @@ export RUSTFS_VOLUMES="./target/volume/test{1...4}"
 export RUSTFS_ADDRESS=":9000"
 export RUSTFS_CONSOLE_ENABLE=true
 export RUSTFS_CONSOLE_ADDRESS=":9001"
-export RUSTFS_EXTERNAL_ADDRESS=":9000"
 # export RUSTFS_SERVER_DOMAINS="localhost:9000"
 # HTTPS certificate directory
 # export RUSTFS_TLS_PATH="./deploy/certs"
@@ -59,7 +58,7 @@ export RUSTFS_EXTERNAL_ADDRESS=":9000"
 #export RUSTFS_OBS_SERVICE_NAME=rustfs # Service name
 #export RUSTFS_OBS_SERVICE_VERSION=0.1.0 # Service version
 export RUSTFS_OBS_ENVIRONMENT=develop # Environment name
-export RUSTFS_OBS_LOGGER_LEVEL=info # Log level, supports trace, debug, info, warn, error
+export RUSTFS_OBS_LOGGER_LEVEL=debug # Log level, supports trace, debug, info, warn, error
 export RUSTFS_OBS_LOCAL_LOGGING_ENABLED=true # Whether to enable local logging
 export RUSTFS_OBS_LOG_DIRECTORY="$current_dir/deploy/logs" # Log directory
 export RUSTFS_OBS_LOG_ROTATION_TIME="hour" # Log rotation time unit, can be "second", "minute", "hour", "day"
@@ -102,7 +101,7 @@ export RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_MASTER="$current_dir/deploy/logs/notify"
 export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 # exportRUSTFS_SKIP_BACKGROUND_TASK=true
 
-export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
+# export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable compression
 
 #export RUSTFS_REGION="us-east-1"
 
@@ -117,7 +116,29 @@ if [ -n "$1" ]; then
 	export RUSTFS_VOLUMES="$1"
 fi
 
+# Enable jemalloc for memory profiling
+# MALLOC_CONF parameters:
+#   prof:true                - Enable heap profiling
+#   prof_active:true         - Start profiling immediately
+#   lg_prof_sample:16        - Average number of bytes between samples (2^16 = 65536 bytes)
+#   log:true                 - Enable logging
+#   narenas:2                - Number of arenas (controls concurrency and memory fragmentation)
+#   lg_chunk:21              - Chunk size (2^21 = 2MB)
+#   background_thread:true   - Enable background threads for purging
+#   dirty_decay_ms:1000      - Time (ms) before dirty pages are purged
+#   muzzy_decay_ms:1000      - Time (ms) before muzzy pages are purged
+# You can override these defaults by setting the MALLOC_CONF environment variable before running this script.
+if [ -z "$MALLOC_CONF" ]; then
+    export MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:16,log:true,narenas:2,lg_chunk:21,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+fi
+
 # Start webhook server
 #cargo run --example webhook -p rustfs-notify &
 # Start main service
+# To run with profiling enabled, uncomment the following line and comment the next line
+#cargo run --profile profiling --bin rustfs
+# To run in release mode, use the following line
+#cargo run --profile release --bin rustfs
+# To run in debug mode, use the following line
 cargo run --bin rustfs
+

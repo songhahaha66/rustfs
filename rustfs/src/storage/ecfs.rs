@@ -14,6 +14,7 @@
 
 use crate::auth::get_condition_values;
 use crate::error::ApiError;
+use crate::storage::options::{filter_object_metadata, get_content_sha256};
 use crate::storage::{
     access::{ReqInfo, authorize_request},
     options::{
@@ -29,9 +30,13 @@ use datafusion::arrow::{
 };
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode};
+use metrics::counter;
 use rustfs_ecstore::{
     bucket::{
-        lifecycle::{bucket_lifecycle_ops::validate_transition_tier, lifecycle::Lifecycle},
+        lifecycle::{
+            bucket_lifecycle_ops::{RestoreRequestOps, post_restore_opts, validate_transition_tier},
+            lifecycle::{self, Lifecycle, TransitionOptions},
+        },
         metadata::{
             BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_REPLICATION_CONFIG,
             BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
@@ -41,8 +46,8 @@ use rustfs_ecstore::{
         object_lock::objectlock_sys::BucketObjectLockSys,
         policy_sys::PolicySys,
         replication::{
-            DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationConfigurationExt, check_replicate_delete,
-            get_must_replicate_options, must_replicate, schedule_replication, schedule_replication_delete,
+            DeletedObjectReplicationInfo, ReplicationConfigurationExt, check_replicate_delete, get_must_replicate_options,
+            must_replicate, schedule_replication, schedule_replication_delete,
         },
         tagging::{decode_tags, encode_tags},
         utils::serialize,
@@ -71,7 +76,9 @@ use rustfs_ecstore::{
         // RESERVED_METADATA_PREFIX,
     },
 };
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, fileinfo::ObjectPartInfo};
+use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
+use rustfs_filemeta::fileinfo::{ObjectPartInfo, RestoreStatusOps};
+use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_kms::{
     DataKey,
     service_manager::get_global_encryption_service,
@@ -95,15 +102,20 @@ use rustfs_targets::{
     EventName,
     arn::{TargetID, TargetIDError},
 };
+use rustfs_utils::http::{AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE};
 use rustfs_utils::{
     CompressionAlgorithm,
     http::{
         AMZ_BUCKET_REPLICATION_STATUS,
-        headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER},
+        headers::{
+            AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE,
+            RESERVED_METADATA_PREFIX_LOWER,
+        },
     },
     path::{is_dir_object, path_join_buf},
 };
 use rustfs_zip::CompressionFormat;
+use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::{
     collections::HashMap,
@@ -341,19 +353,36 @@ impl FS {
     }
 
     async fn put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        let input = req.input;
+
         let PutObjectInput {
             body,
             bucket,
             key,
             version_id,
+            content_length,
+            content_md5,
             ..
-        } = req.input;
+        } = input;
+
         let event_version_id = version_id;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
         let body = StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string()))));
 
-        // let etag_stream = EtagReader::new(body);
+        let size = match content_length {
+            Some(c) => c,
+            None => {
+                if let Some(val) = req.headers.get(AMZ_DECODED_CONTENT_LENGTH) {
+                    match atoi::atoi::<i64>(val.as_bytes()) {
+                        Some(x) => x,
+                        None => return Err(s3_error!(UnexpectedContent)),
+                    }
+                } else {
+                    return Err(s3_error!(UnexpectedContent));
+                }
+            }
+        };
 
         let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
             return Err(s3_error!(InvalidArgument, "key extension not found"));
@@ -361,8 +390,28 @@ impl FS {
 
         let ext = ext.to_owned();
 
+        let md5hex = if let Some(base64_md5) = content_md5 {
+            let md5 = base64_simd::STANDARD
+                .decode_to_vec(base64_md5.as_bytes())
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+
+        let sha256hex = get_content_sha256(&req.headers);
+        let actual_size = size;
+
+        let reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
+
+        let mut hreader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+
+        if let Err(err) = hreader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+        }
+
         // TODO: support zip
-        let decoder = CompressionFormat::from_extension(&ext).get_decoder(body).map_err(|e| {
+        let decoder = CompressionFormat::from_extension(&ext).get_decoder(hreader).map_err(|e| {
             error!("get_decoder err {:?}", e);
             s3_error!(InvalidArgument, "get_decoder err")
         })?;
@@ -423,13 +472,13 @@ impl FS {
                     );
                     metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
-                    let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+                    let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
                     reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
                     size = -1;
                 }
 
-                let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+                let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
                 let mut reader = PutObjReader::new(hrd);
 
                 let _obj_info = store
@@ -479,9 +528,51 @@ impl FS {
         //     Err(e) => error!("Decompression failed: {}", e),
         // }
 
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+
+        if let Some(alg) = &input.checksum_algorithm {
+            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
+            }) {
+                match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                    _ => (),
+                }
+            }
+        }
+
+        warn!(
+            "put object extract checksum_crc32={checksum_crc32:?}, checksum_crc32c={checksum_crc32c:?}, checksum_sha1={checksum_sha1:?}, checksum_sha256={checksum_sha256:?}, checksum_crc64nvme={checksum_crc64nvme:?}",
+        );
+
         // TODO: etag
         let output = PutObjectOutput {
-            // e_tag: Some(etag_stream.etag().await),
+            // e_tag: hreader.try_resolve_etag().map(|v| ETag::Strong(v)),
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -520,6 +611,8 @@ impl S3 for FS {
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+
+        counter!("rustfs_create_bucket_total").increment(1);
 
         store
             .make_bucket(
@@ -682,7 +775,7 @@ impl S3 for FS {
                 .remove(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression-size"));
         }
 
-        let mut reader = HashReader::new(reader, length, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, length, actual_size, None, None, false).map_err(ApiError::from)?;
 
         if let Some(ref sse_alg) = effective_sse {
             if is_managed_sse(sse_alg) {
@@ -702,7 +795,7 @@ impl S3 for FS {
                 effective_kms_key_id = Some(kms_key_used.clone());
 
                 let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+                reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
             }
         }
 
@@ -761,118 +854,180 @@ impl S3 for FS {
         Ok(S3Response::new(output))
     }
 
-    async fn restore_object(&self, _req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
-        Err(s3_error!(NotImplemented, "RestoreObject is not implemented yet"))
-        /*
-        let bucket = params.bucket;
-        if let Err(e) = un_escape_path(params.object) {
+    async fn restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+        let RestoreObjectInput {
+            bucket,
+            key: object,
+            restore_request: rreq,
+            version_id,
+            ..
+        } = req.input.clone();
+        let rreq = rreq.unwrap();
+
+        /*if let Err(e) = un_escape_path(object) {
             warn!("post restore object failed, e: {:?}", e);
             return Err(S3Error::with_message(S3ErrorCode::Custom("PostRestoreObjectFailed".into()), "post restore object failed"));
-        }
+        }*/
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        if Err(err) = check_request_auth_type(req, policy::RestoreObjectAction, bucket, object) {
+        /*if Err(err) = check_request_auth_type(req, policy::RestoreObjectAction, bucket, object) {
             return Err(S3Error::with_message(S3ErrorCode::Custom("PostRestoreObjectFailed".into()), "post restore object failed"));
-        }
+        }*/
 
-        if req.content_length <= 0 {
+        /*if req.content_length <= 0 {
             return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
-        }
-        let Some(opts) = post_restore_opts(req, bucket, object) else {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        }*/
+        let Ok(opts) = post_restore_opts(&version_id.unwrap(), &bucket, &object).await else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         };
 
-        let Some(obj_info) = store.get_object_info(bucket, object, opts) else {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        let Ok(mut obj_info) = store.get_object_info(&bucket, &object, &opts).await else {
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         };
 
         if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         }
 
-        let mut api_err;
-        let Some(rreq) = parse_restore_request(req.body(), req.content_length) else {
-            let api_err = errorCodes.ToAPIErr(ErrMalformedXML);
-            api_err.description = err.Error()
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
-        };
-        let mut status_code = http::StatusCode::OK;
+        //let mut api_err;
+        let mut _status_code = http::StatusCode::OK;
         let mut already_restored = false;
-        if Err(err) = rreq.validate(store) {
-            api_err = errorCodes.ToAPIErr(ErrMalformedXML)
-            api_err.description = err.Error()
-            return Err(S3Error::with_message(S3ErrorCode::Custom("ErrEmptyRequestBody".into()), "post restore object failed"));
+        if let Err(_err) = rreq.validate(store.clone()) {
+            //api_err = to_api_err(ErrMalformedXML);
+            //api_err.description = err.to_string();
+            return Err(S3Error::with_message(
+                S3ErrorCode::Custom("ErrEmptyRequestBody".into()),
+                "post restore object failed",
+            ));
         } else {
-            if obj_info.restore_ongoing && rreq.Type != "SELECT" {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()), "post restore object failed"));
+            if obj_info.restore_ongoing && (rreq.type_.is_none() || rreq.type_.as_ref().unwrap().as_str() != "SELECT") {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrObjectRestoreAlreadyInProgress".into()),
+                    "post restore object failed",
+                ));
             }
-            if !obj_info.restore_ongoing && !obj_info.restore_expires.unix_timestamp() == 0 {
-                status_code = http::StatusCode::Accepted;
+            if !obj_info.restore_ongoing && obj_info.restore_expires.unwrap().unix_timestamp() != 0 {
+                _status_code = http::StatusCode::ACCEPTED;
                 already_restored = true;
             }
         }
-        let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days);
-        let mut metadata = clone_mss(obj_info.user_defined);
+        let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), *rreq.days.as_ref().unwrap());
+        let mut metadata = obj_info.user_defined.clone();
 
-        if rreq.type != "SELECT" {
-            obj_info.metadataOnly = true;
-            metadata[xhttp.AmzRestoreExpiryDays] = rreq.days;
-            metadata[xhttp.AmzRestoreRequestDate] = OffsetDateTime::now_utc().format(http::TimeFormat);
+        let mut header = HeaderMap::new();
+
+        let obj_info_ = obj_info.clone();
+        if rreq.type_.is_none() || rreq.type_.as_ref().unwrap().as_str() != "SELECT" {
+            obj_info.metadata_only = true;
+            metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap().to_string());
+            metadata.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), OffsetDateTime::now_utc().format(&Rfc3339).unwrap());
             if already_restored {
-                metadata[AmzRestore] = completed_restore_obj(restore_expiry).String()
+                metadata.insert(
+                    X_AMZ_RESTORE.as_str().to_string(),
+                    RestoreStatus {
+                        is_restore_in_progress: Some(false),
+                        restore_expiry_date: Some(Timestamp::from(restore_expiry)),
+                    }
+                    .to_string(),
+                );
             } else {
-                metadata[AmzRestore] = ongoing_restore_obj().to_string()
+                metadata.insert(
+                    X_AMZ_RESTORE.as_str().to_string(),
+                    RestoreStatus {
+                        is_restore_in_progress: Some(true),
+                        restore_expiry_date: Some(Timestamp::from(OffsetDateTime::now_utc())),
+                    }
+                    .to_string(),
+                );
             }
             obj_info.user_defined = metadata;
-            if let Err(err) = store.copy_object(bucket, object, bucket, object, obj_info, ObjectOptions {
-                version_id: obj_info.version_id,
-            }, ObjectOptions {
-                version_id: obj_info.version_id,
-                m_time:     obj_info.mod_time,
-            }) {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "post restore object failed"));
+            if let Err(_err) = store
+                .clone()
+                .copy_object(
+                    &bucket,
+                    &object,
+                    &bucket,
+                    &object,
+                    &mut obj_info,
+                    &ObjectOptions {
+                        version_id: obj_info_.version_id.map(|e| e.to_string()),
+                        ..Default::default()
+                    },
+                    &ObjectOptions {
+                        version_id: obj_info_.version_id.map(|e| e.to_string()),
+                        mod_time: obj_info_.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrInvalidObjectState".into()),
+                    "post restore object failed",
+                ));
             }
             if already_restored {
-                return Ok(());
+                let output = RestoreObjectOutput {
+                    request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+                    restore_output_path: None,
+                };
+                return Ok(S3Response::new(output));
             }
         }
 
-        let restore_object = must_get_uuid();
-        if rreq.output_location.s3.bucket_name != "" {
-            w.Header()[AmzRestoreOutputPath] = []string{pathJoin(rreq.OutputLocation.S3.BucketName, rreq.OutputLocation.S3.Prefix, restore_object)}
+        let restore_object = Uuid::new_v4().to_string();
+        //if let Some(rreq) = rreq {
+        if let Some(output_location) = &rreq.output_location {
+            if let Some(s3) = &output_location.s3 {
+                if !s3.bucket_name.is_empty() {
+                    header.insert(
+                        X_AMZ_RESTORE_OUTPUT_PATH,
+                        format!("{}{}{}", s3.bucket_name, s3.prefix, restore_object).parse().unwrap(),
+                    );
+                }
+            }
         }
-        w.WriteHeader(status_code)
-        send_event(EventArgs {
+        //}
+        /*send_event(EventArgs {
             event_name:  event::ObjectRestorePost,
             bucket_name: bucket,
             object:      obj_info,
             req_params:  extract_req_params(r),
             user_agent:  req.user_agent(),
             host:        handlers::get_source_ip(r),
-        });
+        });*/
         tokio::spawn(async move {
-            if !rreq.SelectParameters.IsEmpty() {
-                let actual_size = obj_info.get_actual_size();
+            /*if rreq.select_parameters.is_some() {
+                let actual_size = obj_info_.get_actual_size();
                 if actual_size.is_err() {
                     return Err(S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "post restore object failed"));
                 }
 
-                let object_rsc = s3select.NewObjectReadSeekCloser(
-                    |offset int64| -> (io.ReadCloser, error) {
+                let object_rsc = s3select.new_object_read_seek_closer(
+                    |offset: i64| -> (ReadCloser, error) {
                         rs := &HTTPRangeSpec{
                           IsSuffixLength: false,
                           Start:          offset,
                           End:            -1,
                         }
-                        return getTransitionedObjectReader(bucket, object, rs, r.Header,
-                          obj_info, ObjectOptions {version_id: obj_info.version_id});
+                        return get_transitioned_object_reader(bucket, object, rs, r.Header,
+                            obj_info, ObjectOptions {version_id: obj_info_.version_id});
                     },
                     actual_size.unwrap(),
                 );
-                if err = rreq.SelectParameters.Open(objectRSC); err != nil {
+                if err = rreq.select_parameters.open(object_rsc); err != nil {
                     if serr, ok := err.(s3select.SelectError); ok {
                         let encoded_error_response = encodeResponse(APIErrorResponse {
                             code:       serr.ErrorCode(),
@@ -897,29 +1052,41 @@ impl S3 for FS {
                 rreq.select_parameters.evaluate(rw);
                 rreq.select_parameters.Close();
                 return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header));
-            }
+            }*/
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq,
-                    restore_expiry:  restore_expiry,
+                    restore_expiry,
+                    ..Default::default()
                 },
-                version_id: objInfo.version_id,
-            }
-            if Err(err) = store.restore_transitioned_object(bucket, object, opts) {
-                format!(format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string()));
-                return Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header));
+                version_id: obj_info_.version_id.map(|e| e.to_string()),
+                ..Default::default()
+            };
+            if let Err(err) = store.clone().restore_transitioned_object(&bucket, &object, &opts).await {
+                warn!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err.to_string());
+                return Err(S3Error::with_message(
+                    S3ErrorCode::Custom("ErrRestoreTransitionedObject".into()),
+                    format!("unable to restore transitioned bucket/object {}/{}: {}", bucket, object, err),
+                ));
             }
 
-            send_event(EventArgs {
+            /*send_event(EventArgs {
                 EventName:  event.ObjectRestoreCompleted,
                 BucketName: bucket,
                 Object:     objInfo,
                 ReqParams:  extractReqParams(r),
                 UserAgent:  r.UserAgent(),
                 Host:       handlers.GetSourceIP(r),
-            });
+            });*/
+            Ok(())
         });
-        */
+
+        let output = RestoreObjectOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+            restore_output_path: None,
+        };
+
+        return Ok(S3Response::with_headers(output, header));
     }
 
     /// Delete a bucket
@@ -1471,7 +1638,7 @@ impl S3 for FS {
 
         let mut content_length = info.size;
 
-        let content_range = if let Some(rs) = rs {
+        let content_range = if let Some(rs) = &rs {
             let total_size = info.get_actual_size().map_err(ApiError::from)?;
             let (start, length) = rs.get_offset_length(total_size).map_err(ApiError::from)?;
             content_length = length;
@@ -1654,6 +1821,42 @@ impl S3 for FS {
             .cloned();
         let ssekms_key_id = info.user_defined.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
 
+        let mut checksum_crc32 = None;
+        let mut checksum_crc32c = None;
+        let mut checksum_sha1 = None;
+        let mut checksum_sha256 = None;
+        let mut checksum_crc64nvme = None;
+        let mut checksum_type = None;
+
+        // checksum
+        if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
+            && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
+            && rs.is_none()
+        {
+            let (checksums, _is_multipart) =
+                info.decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+                    .map_err(|e| {
+                        error!("decrypt_checksums error: {}", e);
+                        ApiError::from(e)
+                    })?;
+
+            for (key, checksum) in checksums {
+                if key == AMZ_CHECKSUM_TYPE {
+                    checksum_type = Some(ChecksumType::from(checksum));
+                    continue;
+                }
+
+                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
+                    _ => (),
+                }
+            }
+        }
+
         let output = GetObjectOutput {
             body,
             content_length: Some(response_content_length),
@@ -1662,11 +1865,17 @@ impl S3 for FS {
             accept_ranges: Some("bytes".to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: Some(info.user_defined),
+            metadata: filter_object_metadata(&info.user_defined),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
             ..Default::default()
         };
 
@@ -1757,7 +1966,6 @@ impl S3 for FS {
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
 
-        // warn!("head_object info {:?}", &info);
         let event_info = info.clone();
         let content_type = {
             if let Some(content_type) = &info.content_type {
@@ -1777,7 +1985,10 @@ impl S3 for FS {
 
         // TODO: range download
 
-        let content_length = info.get_actual_size().map_err(ApiError::from)?;
+        let content_length = info.get_actual_size().map_err(|e| {
+            error!("get_actual_size error: {}", e);
+            ApiError::from(e)
+        })?;
 
         let metadata_map = info.user_defined.clone();
         let server_side_encryption = metadata_map
@@ -1789,19 +2000,57 @@ impl S3 for FS {
         let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
         let ssekms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
 
-        let metadata = metadata_map;
+        let mut checksum_crc32 = None;
+        let mut checksum_crc32c = None;
+        let mut checksum_sha1 = None;
+        let mut checksum_sha256 = None;
+        let mut checksum_crc64nvme = None;
+        let mut checksum_type = None;
+
+        // checksum
+        if let Some(checksum_mode) = req.headers.get(AMZ_CHECKSUM_MODE)
+            && checksum_mode.to_str().unwrap_or_default() == "ENABLED"
+            && rs.is_none()
+        {
+            let (checksums, _is_multipart) = info
+                .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+                .map_err(ApiError::from)?;
+
+            debug!("get object metadata checksums: {:?}", checksums);
+            for (key, checksum) in checksums {
+                if key == AMZ_CHECKSUM_TYPE {
+                    checksum_type = Some(ChecksumType::from(checksum));
+                    continue;
+                }
+
+                match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                    rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
+                    rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
+                    rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
+                    _ => (),
+                }
+            }
+        }
 
         let output = HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
             last_modified,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: Some(metadata),
+            metadata: filter_object_metadata(&metadata_map),
             version_id: info.version_id.map(|v| v.to_string()),
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id,
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
             // metadata: object_metadata,
             ..Default::default()
         };
@@ -1923,8 +2172,24 @@ impl S3 for FS {
         };
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
-        let continuation_token = continuation_token.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
+
+        let continuation_token = continuation_token.filter(|v| !v.is_empty());
+
+        // Save the original encoded continuation_token for response
+        let encoded_continuation_token = continuation_token.clone();
+
+        // Decode continuation_token from base64 for internal use
+        let continuation_token = continuation_token
+            .map(|token| {
+                base64_simd::STANDARD
+                    .decode_to_vec(token.as_bytes())
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    .and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                    })
+            })
+            .transpose()?;
 
         let store = get_validated_store(&bucket).await?;
 
@@ -1953,6 +2218,7 @@ impl S3 for FS {
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
                     ..Default::default()
                 };
 
@@ -1974,12 +2240,17 @@ impl S3 for FS {
             .map(|v| CommonPrefix { prefix: Some(v) })
             .collect();
 
+        // Encode next_continuation_token to base64
+        let next_continuation_token = object_infos
+            .next_continuation_token
+            .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
+
         let output = ListObjectsV2Output {
             is_truncated: Some(object_infos.is_truncated),
-            continuation_token: object_infos.continuation_token,
-            next_continuation_token: object_infos.next_continuation_token,
+            continuation_token: encoded_continuation_token,
+            next_continuation_token,
             key_count: Some(key_count),
-            max_keys: Some(key_count),
+            max_keys: Some(max_keys),
             contents: Some(objects),
             delimiter,
             name: Some(bucket),
@@ -2097,6 +2368,7 @@ impl S3 for FS {
             bucket,
             key,
             content_length,
+            content_type,
             tagging,
             metadata,
             version_id,
@@ -2105,6 +2377,7 @@ impl S3 for FS {
             sse_customer_key,
             sse_customer_key_md5,
             ssekms_key_id,
+            content_md5,
             ..
         } = input;
 
@@ -2168,10 +2441,14 @@ impl S3 for FS {
 
         let mut metadata = metadata.unwrap_or_default();
 
-        extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, Some(&key));
+        if let Some(content_type) = content_type {
+            metadata.insert("content-type".to_string(), content_type.to_string());
+        }
+
+        extract_metadata_from_mime_with_object_name(&req.headers, &mut metadata, true, Some(&key));
 
         if let Some(tags) = tagging {
-            metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags);
+            metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_string());
         }
 
         // TDD: Store effective SSE information in metadata for GET responses
@@ -2192,9 +2469,24 @@ impl S3 for FS {
             metadata.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), kms_key_id.clone());
         }
 
+        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id.clone(), &req.headers, metadata.clone())
+            .await
+            .map_err(ApiError::from)?;
+
         let mut reader: Box<dyn Reader> = Box::new(WarpReader::new(body));
 
         let actual_size = size;
+
+        let mut md5hex = if let Some(base64_md5) = content_md5 {
+            let md5 = base64_simd::STANDARD
+                .decode_to_vec(base64_md5.as_bytes())
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+
+        let mut sha256hex = get_content_sha256(&req.headers);
 
         if is_compressible(&req.headers, &key) && size > MIN_COMPRESSIBLE_SIZE as i64 {
             metadata.insert(
@@ -2203,14 +2495,29 @@ impl S3 for FS {
             );
             metadata.insert(format!("{RESERVED_METADATA_PREFIX_LOWER}actual-size",), size.to_string());
 
-            let hrd = HashReader::new(reader, size as i64, size as i64, None, false).map_err(ApiError::from)?;
+            let mut hrd = HashReader::new(reader, size as i64, size as i64, md5hex, sha256hex, false).map_err(ApiError::from)?;
+
+            if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            }
+
+            opts.want_checksum = hrd.checksum();
 
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = -1;
+            md5hex = None;
+            sha256hex = None;
         }
 
-        // TODO: md5 check
-        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+
+        if size >= 0 {
+            if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            }
+
+            opts.want_checksum = reader.checksum();
+        }
 
         // Apply SSE-C encryption if customer provided key
         if let (Some(_), Some(sse_key), Some(sse_key_md5_provided)) =
@@ -2251,7 +2558,7 @@ impl S3 for FS {
 
             // Apply encryption
             let encrypt_reader = EncryptReader::new(reader, key_array, nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         // Apply managed SSE (SSE-S3 or SSE-KMS) when requested
@@ -2275,19 +2582,15 @@ impl S3 for FS {
                     effective_kms_key_id = Some(kms_key_used.clone());
 
                     let encrypt_reader = EncryptReader::new(reader, key_bytes, nonce);
-                    reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+                    reader =
+                        HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
                 }
             }
         }
 
         let mut reader = PutObjReader::new(reader);
 
-        let mt = metadata.clone();
         let mt2 = metadata.clone();
-
-        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, mt)
-            .await
-            .map_err(ApiError::from)?;
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
@@ -2319,18 +2622,56 @@ impl S3 for FS {
             schedule_replication(obj_info, store, dsc, ReplicationType::Object).await;
         }
 
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+
+        if let Some(alg) = &input.checksum_algorithm {
+            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
+            }) {
+                match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                    _ => (),
+                }
+            }
+        }
+
         let output = PutObjectOutput {
             e_tag,
             server_side_encryption: effective_sse, // TDD: Return effective encryption config
-            sse_customer_algorithm,
-            sse_customer_key_md5,
+            sse_customer_algorithm: sse_customer_algorithm.clone(),
+            sse_customer_key_md5: sse_customer_key_md5.clone(),
             ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
             ..Default::default()
         };
 
         let event_args = rustfs_notify::event::EventArgs {
             event_name: EventName::ObjectCreatedPut,
-            bucket_name: bucket,
+            bucket_name: bucket.clone(),
             object: event_info,
             req_params: rustfs_utils::extract_req_params_header(&req.headers),
             resp_elements: rustfs_utils::extract_resp_elements(&S3Response::new(output.clone())),
@@ -2460,14 +2801,29 @@ impl S3 for FS {
             );
         }
 
-        let opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
+        let mut opts: ObjectOptions = put_opts(&bucket, &key, version_id, &req.headers, metadata)
             .await
             .map_err(ApiError::from)?;
 
-        let MultipartUploadResult { upload_id, .. } = store
+        let checksum_type = rustfs_rio::ChecksumType::from_header(&req.headers);
+        if checksum_type.is(rustfs_rio::ChecksumType::INVALID) {
+            return Err(s3_error!(InvalidArgument, "Invalid checksum type"));
+        } else if checksum_type.is_set() && !checksum_type.is(rustfs_rio::ChecksumType::TRAILING) {
+            opts.want_checksum = Some(rustfs_rio::Checksum {
+                checksum_type,
+                ..Default::default()
+            });
+        }
+
+        let MultipartUploadResult {
+            upload_id,
+            checksum_algo,
+            checksum_type,
+        } = store
             .new_multipart_upload(&bucket, &key, &opts)
             .await
             .map_err(ApiError::from)?;
+
         let object_name = key.clone();
         let bucket_name = bucket.clone();
         let output = CreateMultipartUploadOutput {
@@ -2477,6 +2833,8 @@ impl S3 for FS {
             server_side_encryption: effective_sse, // TDD: Return effective encryption config
             sse_customer_algorithm,
             ssekms_key_id: effective_kms_key_id, // TDD: Return effective KMS key ID
+            checksum_algorithm: checksum_algo.map(ChecksumAlgorithm::from),
+            checksum_type: checksum_type.map(ChecksumType::from),
             ..Default::default()
         };
 
@@ -2509,6 +2867,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        let input = req.input;
         let UploadPartInput {
             body,
             bucket,
@@ -2521,7 +2880,7 @@ impl S3 for FS {
             sse_customer_key_md5: _sse_customer_key_md5,
             // content_md5,
             ..
-        } = req.input;
+        } = input;
 
         let part_id = part_number as usize;
 
@@ -2648,19 +3007,41 @@ impl S3 for FS {
         }
         */
 
+        let mut md5hex = if let Some(base64_md5) = input.content_md5 {
+            let md5 = base64_simd::STANDARD
+                .decode_to_vec(base64_md5.as_bytes())
+                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
+
+        let mut sha256hex = get_content_sha256(&req.headers);
+
         if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+            let mut hrd = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+
+            if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+                return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+            }
+
             let compress_reader = CompressReader::new(hrd, CompressionAlgorithm::default());
             reader = Box::new(compress_reader);
             size = -1;
+            md5hex = None;
+            sha256hex = None;
         }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
+
+        if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), size < 0) {
+            return Err(ApiError::from(StorageError::other(format!("add_checksum error={err:?}"))).into());
+        }
 
         if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &fi.user_defined).await? {
             let part_nonce = derive_part_nonce(base_nonce, part_id);
             let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         let mut reader = PutObjReader::new(reader);
@@ -2670,7 +3051,45 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+
+        if let Some(alg) = &input.checksum_algorithm {
+            if let Some(Some(checksum_str)) = req.trailing_headers.as_ref().map(|trailer| {
+                let key = match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
+                    ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
+                    ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
+                    ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
+                    ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+                    _ => return None,
+                };
+                trailer.read(|headers| {
+                    headers
+                        .get(key.unwrap_or_default())
+                        .and_then(|value| value.to_str().ok().map(|s| s.to_string()))
+                })
+            }) {
+                match alg.as_str() {
+                    ChecksumAlgorithm::CRC32 => checksum_crc32 = checksum_str,
+                    ChecksumAlgorithm::CRC32C => checksum_crc32c = checksum_str,
+                    ChecksumAlgorithm::SHA1 => checksum_sha1 = checksum_str,
+                    ChecksumAlgorithm::SHA256 => checksum_sha256 = checksum_str,
+                    ChecksumAlgorithm::CRC64NVME => checksum_crc64nvme = checksum_str,
+                    _ => (),
+                }
+            }
+        }
+
         let output = UploadPartOutput {
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             ..Default::default()
         };
@@ -2784,7 +3203,7 @@ impl S3 for FS {
 
             range_spec
                 .get_offset_length(validation_size)
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, format!("Invalid range: {e}")))?
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e.to_string()))?
         } else {
             (0, src_info.size)
         };
@@ -2828,17 +3247,17 @@ impl S3 for FS {
         let mut size = length;
 
         if is_compressible {
-            let hrd = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+            let hrd = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
             reader = Box::new(CompressReader::new(hrd, CompressionAlgorithm::default()));
             size = -1;
         }
 
-        let mut reader = HashReader::new(reader, size, actual_size, None, false).map_err(ApiError::from)?;
+        let mut reader = HashReader::new(reader, size, actual_size, None, None, false).map_err(ApiError::from)?;
 
         if let Some((key_bytes, base_nonce, _)) = decrypt_managed_encryption_key(&bucket, &key, &mp_info.user_defined).await? {
             let part_nonce = derive_part_nonce(base_nonce, part_id);
             let encrypt_reader = EncryptReader::new(reader, key_bytes, part_nonce);
-            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, false).map_err(ApiError::from)?;
+            reader = HashReader::new(Box::new(encrypt_reader), -1, actual_size, None, None, false).map_err(ApiError::from)?;
         }
 
         let mut reader = PutObjReader::new(reader);
@@ -3009,26 +3428,32 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let input = req.input;
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
             key,
             upload_id,
             ..
-        } = req.input;
-
-        // error!("complete_multipart_upload {:?}", multipart_upload);
-        // mc cp step 5
+        } = input;
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
         let opts = &get_complete_multipart_upload_opts(&req.headers).map_err(ApiError::from)?;
 
-        let mut uploaded_parts = Vec::new();
+        let uploaded_parts = multipart_upload
+            .parts
+            .unwrap_or_default()
+            .into_iter()
+            .map(CompletePart::from)
+            .collect::<Vec<_>>();
 
-        for part in multipart_upload.parts.into_iter().flatten() {
-            uploaded_parts.push(CompletePart::from(part));
+        // is part number sorted?
+        if !uploaded_parts.is_sorted_by_key(|p| p.part_num) {
+            return Err(s3_error!(InvalidPart, "Part numbers must be sorted"));
         }
+
+        // TODO: check object lock
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -3039,6 +3464,7 @@ impl S3 for FS {
             "TDD: Attempting to get multipart info for bucket={}, key={}, upload_id={}",
             bucket, key, upload_id
         );
+
         let multipart_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
@@ -3078,6 +3504,35 @@ impl S3 for FS {
             "TDD: Creating output with SSE: {:?}, KMS Key: {:?}",
             server_side_encryption, ssekms_key_id
         );
+
+        let mut checksum_crc32 = input.checksum_crc32;
+        let mut checksum_crc32c = input.checksum_crc32c;
+        let mut checksum_sha1 = input.checksum_sha1;
+        let mut checksum_sha256 = input.checksum_sha256;
+        let mut checksum_crc64nvme = input.checksum_crc64nvme;
+        let mut checksum_type = input.checksum_type;
+
+        // checksum
+        let (checksums, _is_multipart) = obj_info
+            .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+            .map_err(ApiError::from)?;
+
+        for (key, checksum) in checksums {
+            if key == AMZ_CHECKSUM_TYPE {
+                checksum_type = Some(ChecksumType::from(checksum));
+                continue;
+            }
+
+            match rustfs_rio::ChecksumType::from_string(key.as_str()) {
+                rustfs_rio::ChecksumType::CRC32 => checksum_crc32 = Some(checksum),
+                rustfs_rio::ChecksumType::CRC32C => checksum_crc32c = Some(checksum),
+                rustfs_rio::ChecksumType::SHA1 => checksum_sha1 = Some(checksum),
+                rustfs_rio::ChecksumType::SHA256 => checksum_sha256 = Some(checksum),
+                rustfs_rio::ChecksumType::CRC64_NVME => checksum_crc64nvme = Some(checksum),
+                _ => (),
+            }
+        }
+
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
@@ -3085,6 +3540,12 @@ impl S3 for FS {
             location: Some("us-east-1".to_string()),
             server_side_encryption, // TDD: Return encryption info
             ssekms_key_id,          // TDD: Return KMS key ID if present
+            checksum_crc32,
+            checksum_crc32c,
+            checksum_sha1,
+            checksum_sha256,
+            checksum_crc64nvme,
+            checksum_type,
             ..Default::default()
         };
         info!(
@@ -3407,7 +3868,7 @@ impl S3 for FS {
             .await
             .map_err(ApiError::from)?;
 
-        let conditions = get_condition_values(&req.headers, &auth::Credentials::default());
+        let conditions = get_condition_values(&req.headers, &auth::Credentials::default(), None, None);
 
         let read_only = PolicySys::is_allowed(&BucketPolicyArgs {
             bucket: &bucket,

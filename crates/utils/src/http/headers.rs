@@ -51,10 +51,8 @@ pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
 // S3 transition restore
-pub const AMZ_RESTORE: &str = "x-amz-restore";
 pub const AMZ_RESTORE_EXPIRY_DAYS: &str = "X-Amz-Restore-Expiry-Days";
 pub const AMZ_RESTORE_REQUEST_DATE: &str = "X-Amz-Restore-Request-Date";
-pub const AMZ_RESTORE_OUTPUT_PATH: &str = "x-amz-restore-output-path";
 
 // S3 extensions
 pub const AMZ_COPY_SOURCE_IF_MODIFIED_SINCE: &str = "x-amz-copy-source-if-modified-since";
@@ -176,6 +174,7 @@ pub const RUSTFS_BUCKET_REPLICATION_DELETE_MARKER: &str = "X-Rustfs-Source-Delet
 pub const RUSTFS_BUCKET_REPLICATION_PROXY_REQUEST: &str = "X-Rustfs-Source-Proxy-Request";
 pub const RUSTFS_BUCKET_REPLICATION_REQUEST: &str = "X-Rustfs-Source-Replication-Request";
 pub const RUSTFS_BUCKET_REPLICATION_CHECK: &str = "X-Rustfs-Source-Replication-Check";
+pub const RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM: &str = "X-Rustfs-Source-Replication-Ssec-Crc";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";

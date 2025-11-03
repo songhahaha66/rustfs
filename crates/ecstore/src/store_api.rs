@@ -13,10 +13,8 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys::get_versioning_config;
-use crate::bucket::replication::REPLICATION_RESET;
-use crate::bucket::replication::REPLICATION_STATUS;
-use crate::bucket::replication::{ReplicateDecision, replication_statuses_map, version_purge_statuses_map};
 use crate::bucket::versioning::VersioningApi as _;
+use crate::config::storageclass;
 use crate::disk::DiskStore;
 use crate::error::{Error, Result};
 use crate::store_utils::clean_metadata;
@@ -25,14 +23,18 @@ use crate::{
     bucket::lifecycle::lifecycle::ExpirationOptions,
     bucket::lifecycle::{bucket_lifecycle_ops::TransitionedObject, lifecycle::TransitionOptions},
 };
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{
-    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
+    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision, ReplicationState,
+    ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_rio::Checksum;
 use rustfs_rio::{DecompressReader, HashReader, LimitReader, WarpReader};
 use rustfs_utils::CompressionAlgorithm;
+use rustfs_utils::http::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{AMZ_OBJECT_TAGGING, RESERVED_METADATA_PREFIX_LOWER};
 use rustfs_utils::path::decode_dir_object;
 use serde::{Deserialize, Serialize};
@@ -92,11 +94,28 @@ impl PutObjReader {
         PutObjReader { stream }
     }
 
+    pub fn as_hash_reader(&self) -> &HashReader {
+        &self.stream
+    }
+
     pub fn from_vec(data: Vec<u8>) -> Self {
+        use sha2::{Digest, Sha256};
         let content_length = data.len() as i64;
+        let sha256hex = if content_length > 0 {
+            Some(hex_simd::encode_to_string(Sha256::digest(&data), hex_simd::AsciiCase::Lower))
+        } else {
+            None
+        };
         PutObjReader {
-            stream: HashReader::new(Box::new(WarpReader::new(Cursor::new(data))), content_length, content_length, None, false)
-                .unwrap(),
+            stream: HashReader::new(
+                Box::new(WarpReader::new(Cursor::new(data))),
+                content_length,
+                content_length,
+                None,
+                sha256hex,
+                false,
+            )
+            .unwrap(),
         }
     }
 
@@ -274,7 +293,7 @@ impl HTTPRangeSpec {
             let suffix_len = if self.start < 0 {
                 self.start
                     .checked_neg()
-                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
             } else {
                 self.start
             };
@@ -287,14 +306,14 @@ impl HTTPRangeSpec {
     }
     pub fn get_length(&self, res_size: i64) -> Result<i64> {
         if res_size < 0 {
-            return Err(Error::other("The requested range is not satisfiable"));
+            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
         }
 
         if self.is_suffix_length {
             let specified_len = if self.start < 0 {
                 self.start
                     .checked_neg()
-                    .ok_or_else(|| Error::other("range value invalid: suffix length overflow"))?
+                    .ok_or_else(|| Error::InvalidRangeSpec("range value invalid: suffix length overflow".to_string()))?
             } else {
                 self.start
             };
@@ -308,7 +327,7 @@ impl HTTPRangeSpec {
         }
 
         if self.start >= res_size {
-            return Err(Error::other("The requested range is not satisfiable"));
+            return Err(Error::InvalidRangeSpec("The requested range is not satisfiable".to_string()));
         }
 
         if self.end > -1 {
@@ -326,7 +345,7 @@ impl HTTPRangeSpec {
             return Ok(range_length);
         }
 
-        Err(Error::other(format!(
+        Err(Error::InvalidRangeSpec(format!(
             "range value invalid: start={}, end={}, expected start <= end and end >= -1",
             self.start, self.end
         )))
@@ -374,6 +393,8 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+
+    pub want_checksum: Option<Checksum>,
 }
 
 impl ObjectOptions {
@@ -456,6 +477,8 @@ pub struct BucketInfo {
 #[derive(Debug, Default, Clone)]
 pub struct MultipartUploadResult {
     pub upload_id: String,
+    pub checksum_algo: Option<String>,
+    pub checksum_type: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -471,13 +494,24 @@ pub struct PartInfo {
 pub struct CompletePart {
     pub part_num: usize,
     pub etag: Option<String>,
+    // pub size: Option<usize>,
+    pub checksum_crc32: Option<String>,
+    pub checksum_crc32c: Option<String>,
+    pub checksum_sha1: Option<String>,
+    pub checksum_sha256: Option<String>,
+    pub checksum_crc64nvme: Option<String>,
 }
 
 impl From<s3s::dto::CompletedPart> for CompletePart {
     fn from(value: s3s::dto::CompletedPart) -> Self {
         Self {
             part_num: value.part_number.unwrap_or_default() as usize,
-            etag: value.e_tag.map(|e| e.value().to_owned()),
+            etag: value.e_tag.map(|v| v.value().to_owned()),
+            checksum_crc32: value.checksum_crc32,
+            checksum_crc32c: value.checksum_crc32c,
+            checksum_sha1: value.checksum_sha1,
+            checksum_sha256: value.checksum_sha256,
+            checksum_crc64nvme: value.checksum_crc64nvme,
         }
     }
 }
@@ -486,6 +520,7 @@ impl From<s3s::dto::CompletedPart> for CompletePart {
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
+    pub storage_class: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
     pub size: i64,
     // Actual size is the real size of the object uploaded by client.
@@ -517,7 +552,7 @@ pub struct ObjectInfo {
     pub version_purge_status_internal: Option<String>,
     pub version_purge_status: VersionPurgeStatusType,
     pub replication_decision: String,
-    pub checksum: Vec<u8>,
+    pub checksum: Option<Bytes>,
 }
 
 impl Clone for ObjectInfo {
@@ -525,6 +560,7 @@ impl Clone for ObjectInfo {
         Self {
             bucket: self.bucket.clone(),
             name: self.name.clone(),
+            storage_class: self.storage_class.clone(),
             mod_time: self.mod_time,
             size: self.size,
             actual_size: self.actual_size,
@@ -554,7 +590,7 @@ impl Clone for ObjectInfo {
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
             replication_decision: self.replication_decision.clone(),
-            checksum: Default::default(),
+            checksum: self.checksum.clone(),
             expires: self.expires,
         }
     }
@@ -657,6 +693,12 @@ impl ObjectInfo {
             v
         };
 
+        // Extract storage class from metadata, default to STANDARD if not found
+        let storage_class = metadata
+            .get(AMZ_STORAGE_CLASS)
+            .cloned()
+            .or_else(|| Some(storageclass::STANDARD.to_string()));
+
         // Convert parts from rustfs_filemeta::ObjectPartInfo to store_api::ObjectPartInfo
         let parts = fi
             .parts
@@ -694,6 +736,8 @@ impl ObjectInfo {
             inlined,
             user_defined: metadata,
             transitioned_object,
+            checksum: fi.checksum.clone(),
+            storage_class,
             ..Default::default()
         }
     }
@@ -883,6 +927,23 @@ impl ObjectInfo {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    pub fn decrypt_checksums(&self, part: usize, _headers: &HeaderMap) -> Result<(HashMap<String, String>, bool)> {
+        if part > 0 {
+            if let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone()) {
+                return Ok((checksums, true));
+            }
+        }
+
+        // TODO: decrypt checksums
+
+        if let Some(data) = &self.checksum {
+            let (checksums, is_multipart) = rustfs_rio::read_checksums(data.as_ref(), 0);
+            return Ok((checksums, is_multipart));
+        }
+
+        Ok((HashMap::new(), false))
     }
 }
 
@@ -1275,7 +1336,7 @@ pub trait StorageAPI: ObjectIO + Debug {
     async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String>;
     async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()>;
     async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
-    async fn restore_transitioned_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()>;
     async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
     async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo>;
 
@@ -1311,7 +1372,7 @@ impl<R: AsyncRead + Unpin + Send + Sync> RangedDecompressReader<R> {
         // Validate the range request
         if offset >= total_size {
             tracing::debug!("Range offset {} exceeds total size {}", offset, total_size);
-            return Err(Error::other("Range offset exceeds file size"));
+            return Err(Error::InvalidRangeSpec("Range offset exceeds file size".to_string()));
         }
 
         // Adjust length if it extends beyond file end

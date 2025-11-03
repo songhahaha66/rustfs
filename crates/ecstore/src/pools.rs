@@ -384,7 +384,7 @@ impl PoolMeta {
 
         let mut update = false;
 
-        // 检查指定的池是否需要从已退役的池中移除。
+        // Determine whether the selected pool should be removed from the retired list.
         for k in specified_pools.keys() {
             if let Some(pi) = remembered_pools.get(k) {
                 if pi.completed {
@@ -400,7 +400,7 @@ impl PoolMeta {
                     // )));
                 }
             } else {
-                // 如果之前记住的池不再存在，允许更新，因为可能是添加了一个新池。
+                // If the previous pool no longer exists, allow updates because a new pool may have been added.
                 update = true;
             }
         }
@@ -409,7 +409,7 @@ impl PoolMeta {
             for (k, pi) in remembered_pools.iter() {
                 if let Some(pos) = specified_pools.get(k) {
                     if *pos != pi.position {
-                        update = true; // 池的顺序发生了变化，允许更新。
+                        update = true; // Pool order changed, allow the update.
                     }
                 }
             }
@@ -427,12 +427,12 @@ impl PoolMeta {
         for pool in &self.pools {
             if let Some(decommission) = &pool.decommission {
                 if decommission.complete || decommission.canceled {
-                    // 不需要恢复的情况：
-                    // - 退役已完成
-                    // - 退役已取消
+                    // Recovery is not required when:
+                    // - Decommissioning completed
+                    // - Decommissioning was cancelled
                     continue;
                 }
-                // 其他情况需要恢复
+                // All other scenarios require recovery
                 new_pools.push(pool.clone());
             }
         }
@@ -1140,6 +1140,7 @@ impl ECStore {
                 .await
             {
                 if !is_err_bucket_exists(&err) {
+                    error!("decommission: make bucket failed: {err}");
                     return Err(err);
                 }
             }
@@ -1262,6 +1263,8 @@ impl ECStore {
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
                     etag: pi.etag,
+
+                    ..Default::default()
                 };
             }
 
@@ -1289,7 +1292,7 @@ impl ECStore {
         }
 
         let reader = BufReader::new(rd.stream);
-        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, false)?;
+        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, None, false)?;
         let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self

@@ -421,15 +421,15 @@ impl ECStore {
             if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
                 info!("bucket_rebalance_done: buckets {:?}", &pool_stat.buckets);
 
-                // 使用 retain 来过滤掉要删除的 bucket
+                // Use retain to filter out buckets slated for removal
                 let mut found = false;
                 pool_stat.buckets.retain(|b| {
                     if b.as_str() == bucket.as_str() {
                         found = true;
                         pool_stat.rebalanced_buckets.push(b.clone());
-                        false // 删除这个元素
+                        false // Remove this element
                     } else {
-                        true // 保留这个元素
+                        true // Keep this element
                     }
                 });
 
@@ -946,13 +946,13 @@ impl ECStore {
             let mut reader = rd.stream;
 
             for (i, part) in object_info.parts.iter().enumerate() {
-                // 每次从 reader 中读取一个 part 上传
+                // Read one part from the reader and upload it each time
 
                 let mut chunk = vec![0u8; part.size];
 
                 reader.read_exact(&mut chunk).await?;
 
-                // 每次从 reader 中读取一个 part 上传
+                // Read one part from the reader and upload it each time
                 let mut data = PutObjReader::from_vec(chunk);
 
                 let pi = match self
@@ -979,6 +979,7 @@ impl ECStore {
                 parts[i] = CompletePart {
                     part_num: pi.part_num,
                     etag: pi.etag,
+                    ..Default::default()
                 };
             }
 
@@ -1005,7 +1006,7 @@ impl ECStore {
         }
 
         let reader = BufReader::new(rd.stream);
-        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, false)?;
+        let hrd = HashReader::new(Box::new(WarpReader::new(reader)), object_info.size, object_info.size, None, None, false)?;
         let mut data = PutObjReader::new(hrd);
 
         if let Err(err) = self
